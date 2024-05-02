@@ -5,6 +5,7 @@ import pandas as pd
 import re
 from datetime import datetime
 from langchain_community.document_loaders import UnstructuredFileLoader
+from concurrent.futures import ThreadPoolExecutor
 
 
 def ensure_dir(file_path):
@@ -112,8 +113,38 @@ def extract_sector_codes(
     )
 
 
+def process_single_pdf(
+    pdf_path, strategy, output_dir, log=False, track_errors=False, redo_empty=False
+):
+    """Process a single PDF file."""
+    try:
+        result = extract_sector_codes(
+            pdf_path, strategy, output_dir, log, track_errors, redo_empty
+        )
+        if result:
+            codes, count, processing_time, used_ocr_only = result
+            return {
+                "Document Name": os.path.basename(pdf_path),
+                "Sector Codes": codes,
+                "Number of Codes": count,
+                "Processing Time": processing_time,
+                "Used OCR Only": used_ocr_only,
+            }
+    except Exception as e:
+        log_msg(f"Failed to process {pdf_path}: {e}", log_file)
+        log_msg(
+            f"Failed to process {pdf_path}: {e}", error_log_path, print_console=False
+        )
+    return None
+
+
 def process_pdfs(
-    input_path, output_dir, log=False, track_errors=False, redo_empty=False
+    input_path,
+    output_dir,
+    num_threads=1,
+    log=False,
+    track_errors=False,
+    redo_empty=False,
 ):
     """Process each PDF in a directory or a single PDF file and save results gradually."""
     output_csv = os.path.join(output_dir, "output.csv")
@@ -137,57 +168,50 @@ def process_pdfs(
         )
     )
 
-    if os.path.isdir(input_path):
-        files = [f for f in os.listdir(input_path) if f.lower().endswith(".pdf")]
-    else:
-        files = (
-            [os.path.basename(input_path)]
-            if input_path.lower().endswith(".pdf")
-            else []
-        )
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = []
+        if os.path.isdir(input_path):
+            files = [
+                os.path.join(input_path, f)
+                for f in os.listdir(input_path)
+                if f.lower().endswith(".pdf")
+            ]
+        else:
+            files = [input_path] if input_path.lower().endswith(".pdf") else []
 
-    for filename in files:
-        pdf_path = (
-            os.path.join(input_path, filename)
-            if os.path.isdir(input_path)
-            else input_path
-        )
-        try:
-            result = extract_sector_codes(
-                pdf_path, "fast", output_dir, log, track_errors, redo_empty
+        for filename in files:
+            futures.append(
+                executor.submit(
+                    process_single_pdf,
+                    filename,
+                    "fast",
+                    output_dir,
+                    log,
+                    track_errors,
+                    redo_empty,
+                )
             )
+
+        for future in futures:
+            result = future.result()
             if result:
                 codes, count, processing_time, used_ocr_only = result
                 df = (
-                    df[df["Document Name"] != filename]
-                    if (used_ocr_only or filename in df["Document Name"].tolist())
+                    df[df["Document Name"] != result["Document Name"]]
+                    if (
+                        used_ocr_only
+                        or result["Document Name"] in df["Document Name"].tolist()
+                    )
                     else df
                 )
                 df = pd.concat(
                     [
                         df,
-                        pd.DataFrame(
-                            [
-                                {
-                                    "Document Name": filename,
-                                    "Sector Codes": codes,
-                                    "Number of Codes": count,
-                                    "Processing Time": processing_time,
-                                    "Used OCR Only": used_ocr_only,
-                                }
-                            ]
-                        ),
+                        pd.DataFrame([result]),
                     ],
                     ignore_index=True,
                 )
                 df.to_csv(output_csv, index=False)
-        except Exception as e:
-            log_msg(f"Failed to process {pdf_path}: {e}", log_file)
-            log_msg(
-                f"Failed to process {pdf_path}: {e}",
-                error_log_path,
-                print_console=False,
-            )
 
     log_msg(f"CSV file has been updated: {output_csv}", log_file)
 
@@ -211,6 +235,12 @@ def main():
         action="store_true",
         help="Enable logging of error messages to error_logs.txt",
     )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=1,
+        help="Number of threads or cores to use for parallel processing",
+    )
     args = parser.parse_args()
 
     output_dir = os.path.join("output", args.output_folder_name)
@@ -218,7 +248,13 @@ def main():
 
     # Welcome message
 
-    log_message = f"Analyzing {args.input_path}.\n\n"
+    log_message = f"Analyzing {args.input_path}"
+
+    if args.num_threads == 1:
+        log_message += ".\n\n"
+    else:
+        log_message += f" with {args.num_threads} threads.\n\n"
+
     if args.redo_empty:
         log_message += """
         Files with no sector codes will be double-checked with OCR-only strategy.
@@ -235,7 +271,14 @@ def main():
 
     log_msg(log_message, log_file_path, print_console=True)
 
-    process_pdfs(args.input_path, output_dir, args.log, args.errors, args.redo_empty)
+    process_pdfs(
+        args.input_path,
+        output_dir,
+        args.num_threads,
+        args.log,
+        args.errors,
+        args.redo_empty,
+    )
 
 
 if __name__ == "__main__":

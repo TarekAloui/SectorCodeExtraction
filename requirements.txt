@@ -1,0 +1,14 @@
+PyPDF2
+numpy
+pandas
+matplotlib
+scikit-learn
+fastapi
+uvicorn
+langchain
+langchain-openai
+langchain-community
+faiss-cpu
+pillow
+unstructured[all-docs]
+pytesseract

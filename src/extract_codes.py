@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import pandas as pd
 import re
 from datetime import datetime
@@ -12,7 +13,17 @@ def ensure_dir(file_path):
         os.makedirs(directory)
 
 
-def extract_text_from_pdf(pdf_path, strategy, output_dir):
+def log_msg(message, log_file, print_console=True):
+    if print_console:
+        print(message)
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(message + "\n")
+
+
+def extract_text_from_pdf(
+    pdf_path, strategy, output_dir, log=False, track_errors=False
+):
     """Extract text from a PDF using LangChain's UnstructuredFileLoader with specified strategy."""
     try:
         loader = UnstructuredFileLoader(
@@ -22,23 +33,34 @@ def extract_text_from_pdf(pdf_path, strategy, output_dir):
         text = "\n\n".join([doc.page_content for doc in document])
         return text
     except Exception as e:
-        error_message = f"Error loading PDF {pdf_path}: {str(e)}"
-        print(error_message)
-        error_log_path = os.path.join(output_dir, "error_logs.txt")
-        with open(error_log_path, "a") as error_file:
-            error_file.write(f"{error_message}\n")
+        if track_errors:
+            error_message = f"Error loading PDF {pdf_path}: {str(e)}"
+            error_log_path = os.path.join(output_dir, "error_logs.txt")
+            log_file_path = os.path.join(output_dir, "logs.txt") if log else None
+
+            log_msg(error_message, error_log_path, print_console=False)
+            log_msg(error_message, log_file_path)
 
         skipped_files_path = os.path.join(output_dir, "skipped_files.txt")
-        with open(skipped_files_path, "a") as error_file:
-            error_file.write(f"{pdf_path}\n")
+        log_msg(f"{pdf_path}", skipped_files_path, print_console=False)
 
         return ""
 
 
-def extract_sector_codes(pdf_path, initial_strategy="fast", output_dir="output"):
+def extract_sector_codes(
+    pdf_path,
+    initial_strategy,
+    output_dir,
+    log=False,
+    track_errors=False,
+    redo_empty=False,
+):
     """Extract sector codes from a single PDF with optional strategy switching."""
-    print(f"Processing [{initial_strategy}] {pdf_path}")
-    text = extract_text_from_pdf(pdf_path, initial_strategy, output_dir)
+    log_file_path = os.path.join(output_dir, "logs.txt") if log else None
+    log_msg(f"Processing [{initial_strategy}] {pdf_path}", log_file_path)
+    text = extract_text_from_pdf(
+        pdf_path, initial_strategy, output_dir, log, track_errors
+    )
 
     pattern = r"(paritaire[s]?[^\d]*[\d\s.]+)"
     matches = re.findall(pattern, text, re.IGNORECASE)
@@ -55,18 +77,30 @@ def extract_sector_codes(pdf_path, initial_strategy="fast", output_dir="output")
         number_part = code.split(".")[0]
         if len(number_part) < 3 or not code.replace(".", "", 1).isdigit():
             if initial_strategy == "fast":
-                print(
-                    f"Detected short or invalid codes, switching to ocr_only strategy for better accuracy. Detected: {all_codes}"
+                log_msg(
+                    f"Detected short or invalid codes, switching to ocr_only strategy for better accuracy. Detected: {all_codes}",
+                    log_file_path,
                 )
-                return extract_sector_codes(pdf_path, "ocr_only", output_dir)
+                return extract_sector_codes(
+                    pdf_path, "ocr_only", output_dir, log, track_errors, redo_empty
+                )
         else:
             filtered_codes.append(code)
 
     if initial_strategy == "fast" and not filtered_codes:
-        print(
-            f"Could not detect any valid codes, switching to ocr_only strategy for better accuracy."
-        )
-        return extract_sector_codes(pdf_path, "ocr_only", output_dir)
+        if redo_empty:
+            log_msg(
+                f"Could not detect any valid codes, switching to ocr_only strategy for better accuracy.",
+                log_file_path,
+            )
+            return extract_sector_codes(
+                pdf_path, "ocr_only", output_dir, log, track_errors, redo_empty
+            )
+        else:
+            log_msg(
+                f"Could not detect any valid codes. You can set --redo-empty to double check with ocr_only strategy.",
+                log_file_path,
+            )
 
     processing_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     used_ocr_only = initial_strategy == "ocr_only"
@@ -78,10 +112,16 @@ def extract_sector_codes(pdf_path, initial_strategy="fast", output_dir="output")
     )
 
 
-def process_pdfs(input_path, output_dir):
+def process_pdfs(
+    input_path, output_dir, log=False, track_errors=False, redo_empty=False
+):
     """Process each PDF in a directory or a single PDF file and save results gradually."""
     output_csv = os.path.join(output_dir, "output.csv")
     ensure_dir(output_csv)
+    log_file = os.path.join(output_dir, "logs.txt") if log else None
+    error_log_path = (
+        os.path.join(output_dir, "error_logs.txt") if track_errors else None
+    )
 
     df = (
         pd.read_csv(output_csv)
@@ -113,7 +153,9 @@ def process_pdfs(input_path, output_dir):
             else input_path
         )
         try:
-            result = extract_sector_codes(pdf_path, "fast", output_dir)
+            result = extract_sector_codes(
+                pdf_path, "fast", output_dir, log, track_errors, redo_empty
+            )
             if result:
                 codes, count, processing_time, used_ocr_only = result
                 df = (
@@ -140,21 +182,61 @@ def process_pdfs(input_path, output_dir):
                 )
                 df.to_csv(output_csv, index=False)
         except Exception as e:
-            error_file = os.path.join(output_dir, "processing_errors.txt")
-            with open(error_file, "a") as ef:
-                ef.write(f"Failed to process {pdf_path}: {e}\n")
+            log_msg(f"Failed to process {pdf_path}: {e}", log_file)
+            log_msg(
+                f"Failed to process {pdf_path}: {e}",
+                error_log_path,
+                print_console=False,
+            )
 
-    print("CSV file has been updated:", output_csv)
+    log_msg(f"CSV file has been updated: {output_csv}", log_file)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_path", help="Path to the folder or PDF file to process")
+    parser.add_argument("output_folder_name", help="Name of the output folder")
+    parser.add_argument(
+        "--redo-empty",
+        action="store_true",
+        help="Redoes processing for files with no sector codes with ocr_only strategy to double check",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Enable logging of general messages to logs.txt",
+    )
+    parser.add_argument(
+        "--errors",
+        action="store_true",
+        help="Enable logging of error messages to error_logs.txt",
+    )
+    args = parser.parse_args()
+
+    output_dir = os.path.join("output", args.output_folder_name)
+    ensure_dir(output_dir)  # Ensure the output directory exists
+
+    # Welcome message
+
+    log_message = f"Analyzing {args.input_path}.\n\n"
+    if args.redo_empty:
+        log_message += """
+        Files with no sector codes will be double-checked with OCR-only strategy.
+        This may take longer but could provide more accurate results.\n\n
+        """
+    else:
+        log_message += """
+        Files with no sector codes will be not be double-checked with OCR-only strategy.
+        This may be faster but it might not give the most accurate results
+        You can use --redo-empty for a slower but more accurate result.\n\n
+        """
+
+    log_file_path = os.path.join(output_dir, "logs.txt") if args.log else None
+
+    log_msg(log_message, log_file_path, print_console=True)
+
+    process_pdfs(args.input_path, output_dir, args.log, args.errors, args.redo_empty)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(
-            "Usage: python extract_codes.py 'folder_path_or_pdf_path' 'output_folder_name'"
-        )
-        sys.exit(1)
-    input_path = sys.argv[1]
-    output_folder_name = sys.argv[2]
-    output_dir = os.path.join("output", output_folder_name)
-    ensure_dir(output_dir)  # Ensure the output directory exists
-    process_pdfs(input_path, output_dir)
+    main()

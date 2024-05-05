@@ -1,8 +1,8 @@
 import os
-import sys
 import argparse
 import pandas as pd
 import re
+import threading
 from datetime import datetime
 from langchain_community.document_loaders import UnstructuredFileLoader
 from concurrent.futures import ThreadPoolExecutor
@@ -15,17 +15,19 @@ def ensure_dir(file_path):
 
 
 def log_msg(message, log_file, print_console=True):
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted_message = f"{current_time} - {message}"
     if print_console:
-        print(message)
+        print(formatted_message)
     if log_file:
-        with open(log_file, "a") as f:
-            f.write(message + "\n")
+        with threading.Lock():
+            with open(log_file, "a") as f:
+                f.write(formatted_message + "\n")
 
 
 def extract_text_from_pdf(
     pdf_path, strategy, output_dir, log=False, track_errors=False
 ):
-    """Extract text from a PDF using LangChain's UnstructuredFileLoader with specified strategy."""
     try:
         loader = UnstructuredFileLoader(
             pdf_path, languages=["fra", "nld"], strategy=strategy
@@ -44,7 +46,6 @@ def extract_text_from_pdf(
 
         skipped_files_path = os.path.join(output_dir, "skipped_files.txt")
         log_msg(f"{pdf_path}", skipped_files_path, print_console=False)
-
         return ""
 
 
@@ -56,7 +57,6 @@ def extract_sector_codes(
     track_errors=False,
     redo_empty=False,
 ):
-    """Extract sector codes from a single PDF with optional strategy switching."""
     log_file_path = os.path.join(output_dir, "logs.txt") if log else None
     log_msg(f"Processing [{initial_strategy}] {pdf_path}", log_file_path)
     text = extract_text_from_pdf(
@@ -105,33 +105,28 @@ def extract_sector_codes(
 
     processing_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     used_ocr_only = initial_strategy == "ocr_only"
-    return (
-        "; ".join(filtered_codes),
-        len(filtered_codes),
-        processing_time,
-        used_ocr_only,
-    )
+    return {
+        "Document Name": os.path.basename(pdf_path),
+        "Sector Codes": "; ".join(filtered_codes),
+        "Number of Codes": len(filtered_codes),
+        "Processing Time": processing_time,
+        "Used OCR Only": used_ocr_only,
+    }
 
 
 def process_single_pdf(
     pdf_path, strategy, output_dir, log=False, track_errors=False, redo_empty=False
 ):
-    """Process a single PDF file."""
     try:
         result = extract_sector_codes(
             pdf_path, strategy, output_dir, log, track_errors, redo_empty
         )
         if result:
-            codes, count, processing_time, used_ocr_only = result
-            return {
-                "Document Name": os.path.basename(pdf_path),
-                "Sector Codes": codes,
-                "Number of Codes": count,
-                "Processing Time": processing_time,
-                "Used OCR Only": used_ocr_only,
-            }
+            return result
     except Exception as e:
-        log_msg(f"Failed to process {pdf_path}: {e}", log_file)
+        log_file_path = os.path.join(output_dir, "logs.txt")
+        error_log_path = os.path.join(output_dir, "error_logs.txt")
+        log_msg(f"Failed to process {pdf_path}: {e}", log_file_path)
         log_msg(
             f"Failed to process {pdf_path}: {e}", error_log_path, print_console=False
         )
@@ -146,7 +141,6 @@ def process_pdfs(
     track_errors=False,
     redo_empty=False,
 ):
-    """Process each PDF in a directory or a single PDF file and save results gradually."""
     output_csv = os.path.join(output_dir, "output.csv")
     ensure_dir(output_csv)
     log_file = os.path.join(output_dir, "logs.txt") if log else None
@@ -154,10 +148,10 @@ def process_pdfs(
         os.path.join(output_dir, "error_logs.txt") if track_errors else None
     )
 
-    df = (
-        pd.read_csv(output_csv)
-        if os.path.exists(output_csv)
-        else pd.DataFrame(
+    if os.path.exists(output_csv):
+        df = pd.read_csv(output_csv)
+    else:
+        df = pd.DataFrame(
             columns=[
                 "Document Name",
                 "Sector Codes",
@@ -166,8 +160,8 @@ def process_pdfs(
                 "Used OCR Only",
             ]
         )
-    )
 
+    lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = []
         if os.path.isdir(input_path):
@@ -195,23 +189,10 @@ def process_pdfs(
         for future in futures:
             result = future.result()
             if result:
-                codes, count, processing_time, used_ocr_only = result
-                df = (
-                    df[df["Document Name"] != result["Document Name"]]
-                    if (
-                        used_ocr_only
-                        or result["Document Name"] in df["Document Name"].tolist()
-                    )
-                    else df
-                )
-                df = pd.concat(
-                    [
-                        df,
-                        pd.DataFrame([result]),
-                    ],
-                    ignore_index=True,
-                )
-                df.to_csv(output_csv, index=False)
+                with lock:
+                    df = df[df["Document Name"] != result["Document Name"]]
+                    df = pd.concat([df, pd.DataFrame([result])], ignore_index=True)
+                    df.to_csv(output_csv, index=False)
 
     log_msg(f"CSV file has been updated: {output_csv}", log_file)
 
@@ -244,31 +225,15 @@ def main():
     args = parser.parse_args()
 
     output_dir = os.path.join("output", args.output_folder_name)
-    ensure_dir(output_dir)  # Ensure the output directory exists
+    ensure_dir(output_dir)
 
-    # Welcome message
-
-    log_message = f"Analyzing {args.input_path}"
-
-    if args.num_threads == 1:
-        log_message += ".\n\n"
-    else:
-        log_message += f" with {args.num_threads} threads.\n\n"
-
+    log_message = f"Analyzing {args.input_path} with {args.num_threads} threads.\n"
     if args.redo_empty:
-        log_message += """
-        Files with no sector codes will be double-checked with OCR-only strategy.
-        This may take longer but could provide more accurate results.\n\n
-        """
+        log_message += "Files with no sector codes will be double-checked with OCR-only strategy. This may take longer but could provide more accurate results.\n"
     else:
-        log_message += """
-        Files with no sector codes will be not be double-checked with OCR-only strategy.
-        This may be faster but it might not give the most accurate results
-        You can use --redo-empty for a slower but more accurate result.\n\n
-        """
+        log_message += "Files with no sector codes will not be double-checked with OCR-only strategy. You can use --redo-empty for a slower but more accurate result.\n"
 
     log_file_path = os.path.join(output_dir, "logs.txt") if args.log else None
-
     log_msg(log_message, log_file_path, print_console=True)
 
     process_pdfs(

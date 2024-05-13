@@ -11,5 +11,10 @@ RUN pip install -r requirements.txt
 
 ENV PYTHONPATH=/app
 
-CMD ["python", "src/extract_codes.py"]
+# Add an entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Use the entrypoint script to handle arguments
+ENTRYPOINT ["/app/entrypoint.sh"]
 
